@@ -451,12 +451,16 @@ function drawPerformance(id, { performance: perf, cues, events }) {
   cues.forEach(c => {
     const fireBtn = document.getElementById(`fire-${c.id}`);
     const skipBtn = document.getElementById(`skip-${c.id}`);
+    const retractBtn = document.getElementById(`retract-${c.id}`);
     if (fireBtn) fireBtn.onclick = () => doFire(id, c.id);
     if (skipBtn) skipBtn.onclick = () => doSkip(id, c.id);
+    if (retractBtn) retractBtn.onclick = () => doRetract(id, c.id);
   });
 }
 
-function ACTION_TEXT(a) { return a === 'fired' ? '已触发' : '已跳过'; }
+function ACTION_TEXT(a) {
+  return a === 'fired' ? '已触发' : a === 'skipped' ? '已跳过' : '已撤回';
+}
 
 function cueCard(perfId, c) {
   const depsHtml = c.deps.length
@@ -470,6 +474,7 @@ function cueCard(perfId, c) {
     : '';
   const canAct = c.status === 'pending';
   const done = c.status === 'fired' || c.status === 'skipped';
+  const canRetract = c.status === 'fired';
   return `
     <div class="cue-card ${c.status}">
       <div class="cue-seq">${c.seq}</div>
@@ -487,6 +492,7 @@ function cueCard(perfId, c) {
       <div class="cue-actions">
         <button id="fire-${c.id}" ${canAct ? '' : 'disabled'}>触发</button>
         <button id="skip-${c.id}" class="ghost" ${done ? 'disabled' : ''}>跳过</button>
+        <button id="retract-${c.id}" class="danger" ${canRetract ? '' : 'disabled'}>撤回</button>
       </div>
     </div>`;
 }
@@ -514,6 +520,25 @@ async function doSkip(perfId, cueId) {
       method: 'POST', body: { operator, reason: reason.trim() },
     });
   } catch (e) {
+    toast(e.message, true);
+  }
+  stopPolling();
+  renderPerformance(perfId);
+}
+
+async function doRetract(perfId, cueId) {
+  const operator = getOperator();
+  if (!operator) { toast('请先填写操作人', true); return document.getElementById('operator-input').focus(); }
+  const reason = window.prompt('请填写撤回原因（必填，如：误触发）：');
+  if (reason == null) return;
+  if (!reason.trim()) return toast('撤回必须填写原因', true);
+  try {
+    await api(`/api/performances/${perfId}/cues/${cueId}/retract`, {
+      method: 'POST', body: { operator, reason: reason.trim() },
+    });
+    toast('已撤回，该提示可重新执行');
+  } catch (e) {
+    // 409：当前状态不允许撤回，或下游仍有已触发提示（消息含受影响编号）
     toast(e.message, true);
   }
   stopPolling();

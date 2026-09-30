@@ -2,9 +2,9 @@
 /**
  * API 路由与业务逻辑。
  * 错误约定：返回 { error: 消息, ... } ，状态码语义：
- *   400 参数/前置条件错误（含无已发布版本、版本未发布、跳过缺原因）
+ *   400 参数/前置条件错误（含无已发布版本、版本未发布、跳过/撤回缺原因）
  *   404 资源不存在
- *   409 冲突（提示已有结果、版本已发布不可改）
+ *   409 冲突（提示已有结果、版本已发布不可改、撤回时当前状态不允许或下游仍已触发）
  *   422 校验未通过（缺失引用/循环依赖）或前置未触发（受阻）
  */
 const { db, withTx } = require('./db');
@@ -20,7 +20,7 @@ class HttpError extends Error {
 
 /* ---------------- 工具 ---------------- */
 
-const ACTION_TEXT = { fired: '已触发', skipped: '已跳过' };
+const ACTION_TEXT = { fired: '已触发', skipped: '已跳过', retracted: '已撤回' };
 
 function sanitizeCue(raw) {
   const deps = Array.isArray(raw && raw.deps) ? raw.deps : [];
@@ -57,6 +57,22 @@ function conflictError(existing) {
     `该提示已有结果：${ACTION_TEXT[existing.action]}（操作人 ${existing.operator}，时间 ${existing.created_at}）`,
     { current: existing }
   );
+}
+
+/**
+ * 演出内各提示的最新一条事件（cue_id -> event）。
+ * 当前有效结果规则：最新事件为 fired/skipped 即有效；retracted（已撤回）或无事件 = 无有效结果。
+ * 所有写操作在 BEGIN IMMEDIATE 事务内"读最新→判定→写入"，保证至多一个当前有效结果。
+ */
+function latestEventsByCue(performanceId) {
+  const rows = db.prepare('SELECT * FROM cue_events WHERE performance_id = ? ORDER BY id').all(performanceId);
+  const map = new Map();
+  for (const e of rows) map.set(e.cue_id, e);
+  return map;
+}
+
+function effectiveAction(latest) {
+  return latest && latest.action !== 'retracted' ? latest.action : null;
 }
 
 /* ---------------- 路由表 ---------------- */
@@ -211,14 +227,23 @@ route('GET', '/api/performances/:id', (body, p) => {
   if (!perf) throw new HttpError(404, '演出不存在');
 
   const cues = getVersionCues(perf.version_id);
+  // 完整流水（含撤回），按时间升序；返回时倒序（最新在上）
   const events = db.prepare(`
     SELECT e.*, c.label, c.seq FROM cue_events e
     JOIN cues c ON c.id = e.cue_id
     WHERE e.performance_id = ? ORDER BY e.id
   `).all(perf.id);
 
-  const eventByCue = new Map(events.map((e) => [e.cue_id, e]));
-  const firedLabels = new Set(events.filter((e) => e.action === 'fired').map((e) => e.label));
+  // 归约当前有效结果：fired/skipped 生效，retracted 清除该提示的有效结果
+  const eventByCue = new Map();
+  for (const e of events) {
+    if (e.action === 'retracted') eventByCue.delete(e.cue_id);
+    else eventByCue.set(e.cue_id, e);
+  }
+  const firedLabels = new Set();
+  for (const e of eventByCue.values()) {
+    if (e.action === 'fired') firedLabels.add(e.label);
+  }
 
   const cueStates = cues.map((c) => {
     const event = eventByCue.get(c.id) || null;
@@ -236,7 +261,7 @@ route('GET', '/api/performances/:id', (body, p) => {
   return { performance: perf, cues: cueStates, events: events.slice().reverse() };
 });
 
-/* ---- 触发 / 跳过（并发安全：事务 + 唯一约束） ---- */
+/* ---- 触发 / 跳过 / 撤回（并发安全：BEGIN IMMEDIATE 事务内读最新事件再判定写入） ---- */
 
 function recordEvent(performanceId, cueId, action, operator, reason) {
   return withTx(() => {
@@ -246,19 +271,20 @@ function recordEvent(performanceId, cueId, action, operator, reason) {
     const cue = db.prepare('SELECT * FROM cues WHERE id = ? AND version_id = ?').get(cueId, perf.version_id);
     if (!cue) throw new HttpError(404, '该提示不属于此演出使用的版本');
 
-    const existing = db.prepare('SELECT * FROM cue_events WHERE performance_id = ? AND cue_id = ?')
-      .get(performanceId, cueId);
-    if (existing) throw conflictError(existing);
+    const latestByCue = latestEventsByCue(performanceId);
+    const current = latestByCue.get(cueId) || null;
+    if (effectiveAction(current)) throw conflictError(current);
 
     if (action === 'fired') {
       const deps = JSON.parse(cue.deps);
       if (deps.length) {
+        // 前置是否满足以"当前有效结果为已触发"判定（已撤回的前置不算）
+        const labels = db.prepare('SELECT id, label FROM cues WHERE version_id = ?').all(perf.version_id);
         const fired = new Set(
-          db.prepare(`
-            SELECT c.label FROM cues c
-            JOIN cue_events e ON e.cue_id = c.id
-            WHERE e.performance_id = ? AND e.action = 'fired' AND c.version_id = ?
-          `).all(performanceId, perf.version_id).map((r) => r.label)
+          labels.filter((r) => {
+            const e = latestByCue.get(r.id);
+            return e && e.action === 'fired';
+          }).map((r) => r.label)
         );
         const unmet = deps.filter((d) => !fired.has(d));
         if (unmet.length) {
@@ -267,20 +293,74 @@ function recordEvent(performanceId, cueId, action, operator, reason) {
       }
     }
 
-    try {
-      const info = db.prepare(
-        'INSERT INTO cue_events (performance_id, cue_id, action, operator, reason) VALUES (?,?,?,?,?)'
-      ).run(performanceId, cueId, action, operator, reason);
-      return { event: db.prepare('SELECT * FROM cue_events WHERE id = ?').get(Number(info.lastInsertRowid)) };
-    } catch (err) {
-      // 并发兜底：唯一约束冲突时告知当前状态
-      if (String(err.code || '').startsWith('SQLITE_CONSTRAINT')) {
-        const cur = db.prepare('SELECT * FROM cue_events WHERE performance_id = ? AND cue_id = ?')
-          .get(performanceId, cueId);
-        if (cur) throw conflictError(cur);
-      }
-      throw err;
+    const info = db.prepare(
+      'INSERT INTO cue_events (performance_id, cue_id, action, operator, reason) VALUES (?,?,?,?,?)'
+    ).run(performanceId, cueId, action, operator, reason);
+    return { event: db.prepare('SELECT * FROM cue_events WHERE id = ?').get(Number(info.lastInsertRowid)) };
+  });
+}
+
+/**
+ * 撤回误触发：仅当前有效结果为"已触发"可撤回；已跳过 / 未触发（含已撤回）拒绝。
+ * 若沿前置关系可达的后续提示仍有有效"已触发"，整体拒绝并列出受影响编号，任何记录都不改变。
+ * 成功后写入 retracted 流水（原触发记录保留），提示回到 待执行 / 受阻，可再次触发或跳过。
+ */
+function retractEvent(performanceId, cueId, operator, reason) {
+  return withTx(() => {
+    const perf = db.prepare('SELECT * FROM performances WHERE id = ?').get(performanceId);
+    if (!perf) throw new HttpError(404, '演出不存在');
+
+    const cue = db.prepare('SELECT * FROM cues WHERE id = ? AND version_id = ?').get(cueId, perf.version_id);
+    if (!cue) throw new HttpError(404, '该提示不属于此演出使用的版本');
+
+    const latestByCue = latestEventsByCue(performanceId);
+    const latest = latestByCue.get(cueId) || null;
+    const current = effectiveAction(latest);
+    if (current === 'skipped') {
+      throw new HttpError(
+        409,
+        `该提示当前结果为已跳过，不能撤回（操作人 ${latest.operator}，时间 ${latest.created_at}）`,
+        { current: latest }
+      );
     }
+    if (current !== 'fired') {
+      throw new HttpError(409, '该提示当前未处于已触发状态，不能撤回', { current: latest });
+    }
+
+    // 反向 BFS：沿前置关系找出所有下游提示，其中仍有效"已触发"的即为受影响项
+    const cues = getVersionCues(perf.version_id);
+    const childrenOf = new Map();
+    for (const c of cues) {
+      for (const dep of c.deps) {
+        if (!childrenOf.has(dep)) childrenOf.set(dep, []);
+        childrenOf.get(dep).push(c);
+      }
+    }
+    const affected = [];
+    const visited = new Set([cue.label]);
+    const queue = [cue.label];
+    while (queue.length) {
+      const curLabel = queue.shift();
+      for (const child of childrenOf.get(curLabel) || []) {
+        if (visited.has(child.label)) continue;
+        visited.add(child.label);
+        queue.push(child.label);
+        const e = latestByCue.get(child.id);
+        if (e && e.action === 'fired') affected.push(child.label);
+      }
+    }
+    if (affected.length) {
+      throw new HttpError(
+        409,
+        `无法撤回：以下后续提示仍处于已触发状态，请先撤回：${affected.join('、')}`,
+        { affected }
+      );
+    }
+
+    const info = db.prepare(
+      'INSERT INTO cue_events (performance_id, cue_id, action, operator, reason) VALUES (?,?,?,?,?)'
+    ).run(performanceId, cueId, 'retracted', operator, reason);
+    return { event: db.prepare('SELECT * FROM cue_events WHERE id = ?').get(Number(info.lastInsertRowid)) };
   });
 }
 
@@ -296,6 +376,14 @@ route('POST', '/api/performances/:id/cues/:cueId/skip', (body, p) => {
   const reason = String(body.reason || '').trim().slice(0, 200);
   if (!reason) throw new HttpError(400, '跳过必须填写原因');
   return recordEvent(Number(p.id), Number(p.cueId), 'skipped', operator, reason);
+});
+
+route('POST', '/api/performances/:id/cues/:cueId/retract', (body, p) => {
+  const operator = String(body.operator || '').trim().slice(0, 50);
+  if (!operator) throw new HttpError(400, '请填写操作人');
+  const reason = String(body.reason || '').trim().slice(0, 200);
+  if (!reason) throw new HttpError(400, '撤回必须填写原因');
+  return retractEvent(Number(p.id), Number(p.cueId), operator, reason);
 });
 
 /* ---------------- 分发 ---------------- */

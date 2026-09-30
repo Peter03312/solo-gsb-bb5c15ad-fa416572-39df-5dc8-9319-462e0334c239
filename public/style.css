@@ -10,6 +10,7 @@
   --fired: #4cc38a;
   --skipped: #8a8f9c;
   --blocked: #e06c75;
+  --retracted: #b48dd6;
 }
 * { box-sizing: border-box; }
 body {
@@ -93,6 +94,7 @@ th { color: var(--muted); font-weight: 500; font-size: 13px; }
 .status.fired { color: var(--fired); }
 .status.skipped { color: var(--skipped); }
 .status.blocked { color: var(--blocked); }
+.status.retracted { color: var(--retracted); }
 
 /* 执行台提示卡片 */
 .cue-card {

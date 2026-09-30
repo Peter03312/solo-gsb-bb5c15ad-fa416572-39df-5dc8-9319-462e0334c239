@@ -57,18 +57,52 @@ CREATE TABLE IF NOT EXISTS performances (
   started_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
--- 执行结果：同一演出同一提示仅一条有效结果（唯一约束保证并发只记一次）
+-- 执行流水：触发 / 跳过 / 撤回 全量留痕；同一演出同一提示的"当前有效结果"
+-- 由最新一条事件推导（retracted 表示已撤回、当前无有效结果），
+-- 并发一致性由 BEGIN IMMEDIATE 事务内"读最新事件→判定→写入"保证
 CREATE TABLE IF NOT EXISTS cue_events (
   id             INTEGER PRIMARY KEY AUTOINCREMENT,
   performance_id INTEGER NOT NULL REFERENCES performances(id) ON DELETE CASCADE,
   cue_id         INTEGER NOT NULL REFERENCES cues(id),
-  action         TEXT NOT NULL CHECK (action IN ('fired','skipped')),
+  action         TEXT NOT NULL CHECK (action IN ('fired','skipped','retracted')),
   operator       TEXT NOT NULL,
   reason         TEXT,
-  created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-  UNIQUE (performance_id, cue_id)
+  created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
+CREATE INDEX IF NOT EXISTS idx_cue_events_perf ON cue_events(performance_id, cue_id, id);
 `);
+
+/**
+ * 旧库迁移：早期 cue_events 带 UNIQUE(performance_id, cue_id) 且不含 retracted 动作，
+ * 无法记录多条流水。检测后重建表（保留全部既有记录），新库此函数为空操作。
+ */
+function migrateCueEventsIfNeeded() {
+  const row = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'cue_events'").get();
+  if (!row || row.sql.includes('retracted')) return;
+  db.exec('PRAGMA foreign_keys = OFF');
+  withTx(() => {
+    db.exec(`
+      CREATE TABLE cue_events_mig (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        performance_id INTEGER NOT NULL REFERENCES performances(id) ON DELETE CASCADE,
+        cue_id         INTEGER NOT NULL REFERENCES cues(id),
+        action         TEXT NOT NULL CHECK (action IN ('fired','skipped','retracted')),
+        operator       TEXT NOT NULL,
+        reason         TEXT,
+        created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+      );
+      INSERT INTO cue_events_mig (id, performance_id, cue_id, action, operator, reason, created_at)
+        SELECT id, performance_id, cue_id, action, operator, reason, created_at FROM cue_events;
+      DROP TABLE cue_events;
+      ALTER TABLE cue_events_mig RENAME TO cue_events;
+      CREATE INDEX IF NOT EXISTS idx_cue_events_perf ON cue_events(performance_id, cue_id, id);
+    `);
+  });
+  db.exec('PRAGMA foreign_keys = ON');
+  console.log('[init] 已迁移 cue_events 表：支持撤回流水（保留全部历史记录）');
+}
+
+migrateCueEventsIfNeeded();
 
 /** 事务包装：BEGIN IMMEDIATE 保证写操作串行，冲突时整体回滚 */
 function withTx(fn) {
