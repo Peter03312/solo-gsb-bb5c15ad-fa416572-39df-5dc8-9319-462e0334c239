@@ -7,7 +7,6 @@ const connEl = document.getElementById('conn');
 
 const TYPE_TEXT = { light: '灯光', sound: '音效', set: '布景', other: '其他' };
 const STATUS_TEXT = { pending: '待执行', fired: '已触发', skipped: '已跳过', blocked: '受阻' };
-
 let toastTimer = null;
 let pollTimer = null;
 
@@ -432,13 +431,13 @@ function drawPerformance(id, { performance: perf, cues, events }) {
         ${cues.map(c => cueCard(id, c)).join('')}
       </div>
       <div class="panel event-log">
-        <b>执行记录（最新在上）</b>
+        <b>执行流水（完整记录 · 最新在上）</b>
         ${events.length === 0 ? '<p class="muted">暂无记录</p>' : `
         <ul>
           ${events.map(e => `
-            <li>
+            <li class="log-${e.action}${e.effective ? '' : ' log-inactive'}">
               <span class="status ${e.action}">${ACTION_TEXT(e.action)}</span>
-              <b>${esc(e.label)}</b><br>
+              <b>${esc(e.label)}</b>${e.effective || e.action === 'recalled' ? '' : '<span class="stale-tag">已失效</span>'}<br>
               <span class="muted">${esc(e.operator)} · ${fmtTime(e.created_at)}${e.reason ? '<br>原因：' + esc(e.reason) : ''}</span>
             </li>`).join('')}
         </ul>`}
@@ -451,12 +450,18 @@ function drawPerformance(id, { performance: perf, cues, events }) {
   cues.forEach(c => {
     const fireBtn = document.getElementById(`fire-${c.id}`);
     const skipBtn = document.getElementById(`skip-${c.id}`);
+    const recallBtn = document.getElementById(`recall-${c.id}`);
     if (fireBtn) fireBtn.onclick = () => doFire(id, c.id);
     if (skipBtn) skipBtn.onclick = () => doSkip(id, c.id);
+    if (recallBtn) recallBtn.onclick = () => doRecall(id, c.id);
   });
 }
 
-function ACTION_TEXT(a) { return a === 'fired' ? '已触发' : '已跳过'; }
+function ACTION_TEXT(a) {
+  if (a === 'fired') return '已触发';
+  if (a === 'skipped') return '已跳过';
+  return '撤回';
+}
 
 function cueCard(perfId, c) {
   const depsHtml = c.deps.length
@@ -487,6 +492,7 @@ function cueCard(perfId, c) {
       <div class="cue-actions">
         <button id="fire-${c.id}" ${canAct ? '' : 'disabled'}>触发</button>
         <button id="skip-${c.id}" class="ghost" ${done ? 'disabled' : ''}>跳过</button>
+        ${c.status === 'fired' ? `<button id="recall-${c.id}" class="danger">撤回</button>` : ''}
       </div>
     </div>`;
 }
@@ -515,6 +521,27 @@ async function doSkip(perfId, cueId) {
     });
   } catch (e) {
     toast(e.message, true);
+  }
+  stopPolling();
+  renderPerformance(perfId);
+}
+
+async function doRecall(perfId, cueId) {
+  const operator = getOperator();
+  if (!operator) { toast('请先填写撤回人（页面上方操作人）', true); return document.getElementById('operator-input').focus(); }
+  const reason = window.prompt('撤回将保留完整流水。请填写撤回原因（必填）：');
+  if (reason == null) return;
+  if (!reason.trim()) return toast('撤回必须填写原因', true);
+  try {
+    await api(`/api/performances/${perfId}/cues/${cueId}/recall`, {
+      method: 'POST', body: { operator, reason: reason.trim() },
+    });
+    toast('已撤回，原触发与撤回流水均已保留');
+  } catch (e) {
+    // 422 后续仍已触发（附 affected）/ 409 非已触发 / 400 缺字段
+    toast(e.data && e.data.affected && e.data.affected.length
+      ? `${e.message}（受影响编号：${e.data.affected.join('、')}）`
+      : e.message, true);
   }
   stopPolling();
   renderPerformance(perfId);

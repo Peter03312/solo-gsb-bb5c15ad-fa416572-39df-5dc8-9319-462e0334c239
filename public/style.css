@@ -10,6 +10,7 @@
   --fired: #4cc38a;
   --skipped: #8a8f9c;
   --blocked: #e06c75;
+  --recalled: #c98af0;
 }
 * { box-sizing: border-box; }
 body {
@@ -93,6 +94,7 @@ th { color: var(--muted); font-weight: 500; font-size: 13px; }
 .status.fired { color: var(--fired); }
 .status.skipped { color: var(--skipped); }
 .status.blocked { color: var(--blocked); }
+.status.recalled { color: var(--recalled); }
 
 /* 执行台提示卡片 */
 .cue-card {
@@ -159,7 +161,13 @@ th { color: var(--muted); font-weight: 500; font-size: 13px; }
 
 .perf-head { position: sticky; top: 53px; z-index: 5; background: var(--bg); padding: 8px 0; }
 .event-log { font-size: 13px; }
-.event-log li { margin: 6px 0; list-style: none; }
+.event-log li { margin: 6px 0; list-style: none; padding: 4px 8px; border-radius: 6px; }
 .event-log ul { padding-left: 0; margin: 0; }
+.event-log li.log-recalled { background: #2e2140; border: 1px solid var(--recalled); }
+.event-log li.log-inactive { opacity: 0.55; }
+.stale-tag {
+  margin-left: 8px; font-size: 11px; color: var(--muted);
+  border: 1px solid var(--border); border-radius: 999px; padding: 0 7px;
+}
 .grid-2 { display: grid; grid-template-columns: 1fr 300px; gap: 16px; align-items: start; }
 @media (max-width: 860px) { .grid-2 { grid-template-columns: 1fr; } }

@@ -16,6 +16,24 @@ const db = new DatabaseSync(DB_PATH);
 db.exec('PRAGMA journal_mode = WAL;');
 db.exec('PRAGMA foreign_keys = ON;');
 
+/** 事务包装：BEGIN IMMEDIATE 保证写操作串行，冲突时整体回滚 */
+function withTx(fn) {
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const result = fn();
+    db.exec('COMMIT');
+    return result;
+  } catch (err) {
+    try { db.exec('ROLLBACK'); } catch (_) { /* already rolled back */ }
+    throw err;
+  }
+}
+
+function tableExists(name) {
+  return !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?").get(name);
+}
+
+/* 不变的基础表（场次 / 版本 / 提示 / 演出） */
 db.exec(`
 CREATE TABLE IF NOT EXISTS shows (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -56,32 +74,69 @@ CREATE TABLE IF NOT EXISTS performances (
   started_by  TEXT NOT NULL DEFAULT '',
   started_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
-
--- 执行结果：同一演出同一提示仅一条有效结果（唯一约束保证并发只记一次）
-CREATE TABLE IF NOT EXISTS cue_events (
-  id             INTEGER PRIMARY KEY AUTOINCREMENT,
-  performance_id INTEGER NOT NULL REFERENCES performances(id) ON DELETE CASCADE,
-  cue_id         INTEGER NOT NULL REFERENCES cues(id),
-  action         TEXT NOT NULL CHECK (action IN ('fired','skipped')),
-  operator       TEXT NOT NULL,
-  reason         TEXT,
-  created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-  UNIQUE (performance_id, cue_id)
-);
 `);
 
-/** 事务包装：BEGIN IMMEDIATE 保证写操作串行，冲突时整体回滚 */
-function withTx(fn) {
-  db.exec('BEGIN IMMEDIATE');
-  try {
-    const result = fn();
-    db.exec('COMMIT');
-    return result;
-  } catch (err) {
-    try { db.exec('ROLLBACK'); } catch (_) { /* already rolled back */ }
-    throw err;
-  }
+/*
+ * 执行流水（追加式，只增不改）：
+ *   fired / skipped 为一次有效结果；recalled 为撤回记录（recalled_event_id 指向被撤回的结果）。
+ * 同一提示的「当前有效结果」= 该提示最新一条 fired/skipped；最新一条为 recalled 时无有效结果。
+ * 触发 / 跳过 / 撤回均在 BEGIN IMMEDIATE 事务内基于有效状态判定，因此并发下至多一个有效结果。
+ */
+function createCueEventsTable() {
+  db.exec(`
+CREATE TABLE IF NOT EXISTS cue_events (
+  id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+  performance_id     INTEGER NOT NULL REFERENCES performances(id) ON DELETE CASCADE,
+  cue_id             INTEGER NOT NULL REFERENCES cues(id),
+  action             TEXT NOT NULL CHECK (action IN ('fired','skipped','recalled')),
+  operator           TEXT NOT NULL,
+  reason             TEXT,
+  recalled_event_id  INTEGER,
+  created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_cue_events_perf ON cue_events(performance_id);
+  `);
 }
+
+/**
+ * 旧库迁移：旧表 cue_events 带 UNIQUE(performance_id, cue_id)、无 recalled 动作。
+ * 整体重命名后按新结构重建并搬移历史流水，已有演出记录原样保留。
+ */
+function migrateCueEventsIfLegacy() {
+  if (!tableExists('cue_events')) {
+    createCueEventsTable();
+    return;
+  }
+  const cols = db.prepare('PRAGMA table_info(cue_events)').all();
+  if (cols.some((c) => c.name === 'recalled_event_id')) {
+    createCueEventsTable(); // 新库：仅补建索引（IF NOT EXISTS 均为空操作）
+    return;
+  }
+  withTx(() => {
+    db.exec('ALTER TABLE cue_events RENAME TO cue_events_legacy;');
+    db.exec(`
+CREATE TABLE cue_events (
+  id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+  performance_id     INTEGER NOT NULL REFERENCES performances(id) ON DELETE CASCADE,
+  cue_id             INTEGER NOT NULL REFERENCES cues(id),
+  action             TEXT NOT NULL CHECK (action IN ('fired','skipped','recalled')),
+  operator           TEXT NOT NULL,
+  reason             TEXT,
+  recalled_event_id  INTEGER,
+  created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+    `);
+    db.exec(`
+INSERT INTO cue_events (id, performance_id, cue_id, action, operator, reason, recalled_event_id, created_at)
+SELECT id, performance_id, cue_id, action, operator, reason, NULL, created_at FROM cue_events_legacy;
+    `);
+    db.exec('DROP TABLE cue_events_legacy;');
+    db.exec('CREATE INDEX idx_cue_events_perf ON cue_events(performance_id);');
+  });
+  console.log('[init] 已迁移 cue_events 为追加式流水（支持撤回，历史记录已保留）');
+}
+
+migrateCueEventsIfLegacy();
 
 /** 空库初始化演示数据（便于一键启动后直接体验） */
 function seedDemoIfEmpty() {
